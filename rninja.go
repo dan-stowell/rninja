@@ -78,6 +78,8 @@ func executeBuildAction(action BuildAction) error {
 		}
 		fmt.Println("Build outputs restored from cache")
 		return nil
+	} else {
+		return fmt.Errorf("failed to get action result: %v", err)
 	}
 
 	// Cache miss - execute the command
