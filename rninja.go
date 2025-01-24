@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -234,6 +235,7 @@ func expandVariables(command string, in []string, out []string) string {
 }
 
 func (rc *RemoteCache) processNinjaBuild(ctx context.Context, build *Build, rule *Rule) error {
+	log.Printf("processNinjaBuild %v", build)
 	// Create Action from build and rule
 	action := &remote.Action{
 		CommandDigest:   &remote.Digest{}, // We'll set this after uploading command
@@ -318,7 +320,7 @@ func (rc *RemoteCache) processNinjaBuild(ctx context.Context, build *Build, rule
 
 	// Cache miss - execute command locally
 	cmd := exec.CommandContext(ctx, command.Arguments[0], command.Arguments[1:]...)
-	fmt.Printf("=== %s", cmd)
+	log.Printf("=== %s", cmd)
 	cmd.Stdout = os.Stdout // Capture output
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -365,13 +367,14 @@ func resolveDependencies(nf *NinjaFile, target string) []*Build {
 		if visited[output] {
 			return
 		}
-		visited[output] = true
+		// visited[output] = true
 
 		if build, exists := nf.Builds[output]; exists {
+			log.Printf("output %s appending %v", output, build.Inputs)
+			builds = append(builds, build)
 			for _, input := range build.Inputs {
 				resolve(input)
 			}
-			builds = append(builds, build)
 		}
 	}
 
