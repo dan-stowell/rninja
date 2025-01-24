@@ -43,7 +43,7 @@ func executeBuildAction(action BuildAction) error {
 	ctx := context.Background()
 
 	// Connect to remote cache server
-	conn, err := grpc.Dial("localhost:8980", grpc.WithInsecure())
+	conn, err := grpc.Dial("127.0.0.1:8980", grpc.WithInsecure(), grpc.WithBlock())
 	if err != nil {
 		return fmt.Errorf("failed to connect to remote cache: %v", err)
 	}
@@ -66,6 +66,7 @@ func executeBuildAction(action BuildAction) error {
 
 	// Check if result exists in action cache
 	req := &pb.GetActionResultRequest{
+		InstanceName: "",
 		ActionDigest: actionDigest,
 	}
 	result, err := acClient.GetActionResult(ctx, req)
@@ -78,8 +79,6 @@ func executeBuildAction(action BuildAction) error {
 		}
 		fmt.Println("Build outputs restored from cache")
 		return nil
-	} else {
-		return fmt.Errorf("failed to get action result: %v", err)
 	}
 
 	// Cache miss - execute the command
