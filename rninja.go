@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	pb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
+	remote "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 )
@@ -31,13 +31,13 @@ type Build struct {
 
 type NinjaFile struct {
 	Rules  map[string]*Rule
-	Builds []*Build
+	Builds map[string]*Build
 }
 
 func ParseNinja(r io.Reader) (*NinjaFile, error) {
 	nf := &NinjaFile{
 		Rules:  make(map[string]*Rule),
-		Builds: make([]*Build, 0),
+		Builds: make(map[string]*Build),
 	}
 
 	scanner := bufio.NewScanner(r)
@@ -89,7 +89,9 @@ func ParseNinja(r io.Reader) (*NinjaFile, error) {
 		if strings.HasPrefix(line, "build ") {
 			build := parseBuildLine(line)
 			if build != nil {
-				nf.Builds = append(nf.Builds, build)
+				for _, output := range build.Outputs {
+					nf.Builds[output] = build
+				}
 			}
 			currentRule = nil
 		}
@@ -122,17 +124,296 @@ func parseBuildLine(line string) *Build {
 	}
 }
 
-// Example usage:
+// // Example usage:
+// func main() {
+// 	// 	ninjaContent := `rule clang_rule
+// 	//     depfile = $out.d
+// 	//     command = clang -g -Wall $
+// 	//         -MMD -MF $out.d $
+// 	//         -Wextra -Wno-sign-compare $
+// 	//         -O2 -c -o $out $in
+
+// 	// build .obj/examples/fib.o: clang_rule examples/fib.c`
+
+// 	r, err := os.Open("build.ninja")
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	nf, err := ParseNinja(r)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	// Access parsed data
+// 	fmt.Printf("rule count %d build count %d", len(nf.Rules), len(nf.Builds))
+// }
+
+type RemoteCache struct {
+	client      remote.ExecutionClient
+	actionCache remote.ActionCacheClient
+	cas         remote.ContentAddressableStorageClient
+}
+
+func NewRemoteCache(conn *grpc.ClientConn) *RemoteCache {
+	return &RemoteCache{
+		client:      remote.NewExecutionClient(conn),
+		actionCache: remote.NewActionCacheClient(conn),
+		cas:         remote.NewContentAddressableStorageClient(conn),
+	}
+}
+
+func computeActionDigest(action *remote.Action) (*remote.Digest, error) {
+	data, err := proto.Marshal(action)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal Action: %v", err)
+	}
+
+	hash := sha256.Sum256(data)
+	return &remote.Digest{
+		Hash:      hex.EncodeToString(hash[:]),
+		SizeBytes: int64(len(data)),
+	}, nil
+}
+
+func (rc *RemoteCache) uploadBlob(ctx context.Context, data []byte) (*remote.Digest, error) {
+	hash := sha256.Sum256(data)
+	digest := &remote.Digest{
+		Hash:      hex.EncodeToString(hash[:]),
+		SizeBytes: int64(len(data)),
+	}
+
+	// Check if blob already exists
+	resp, err := rc.cas.FindMissingBlobs(ctx, &remote.FindMissingBlobsRequest{
+		BlobDigests: []*remote.Digest{digest},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to check blob existence: %v", err)
+	}
+
+	if len(resp.MissingBlobDigests) > 0 {
+		// Upload if missing
+		_, err = rc.cas.BatchUpdateBlobs(ctx, &remote.BatchUpdateBlobsRequest{
+			Requests: []*remote.BatchUpdateBlobsRequest_Request{{
+				Digest: digest,
+				Data:   data,
+			}},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to upload blob: %v", err)
+		}
+	}
+
+	return digest, nil
+}
+
+func (rc *RemoteCache) downloadBlob(ctx context.Context, digest *remote.Digest) ([]byte, error) {
+	resp, err := rc.cas.BatchReadBlobs(ctx, &remote.BatchReadBlobsRequest{
+		Digests: []*remote.Digest{digest},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to download blob: %v", err)
+	}
+
+	if len(resp.Responses) != 1 {
+		return nil, fmt.Errorf("unexpected number of responses: %d", len(resp.Responses))
+	}
+
+	if resp.Responses[0].Status.Code != 0 {
+		return nil, fmt.Errorf("failed to read blob: %v", resp.Responses[0].Status.Message)
+	}
+
+	return resp.Responses[0].Data, nil
+}
+
+func expandVariables(command string, in []string, out []string) string {
+	command = strings.ReplaceAll(command, "${in}", strings.Join(in, " "))
+	command = strings.ReplaceAll(command, "${out}", strings.Join(out, " "))
+	command = strings.ReplaceAll(command, "$in", strings.Join(in, " "))
+	command = strings.ReplaceAll(command, "$out", strings.Join(out, " "))
+	return command
+}
+
+func (rc *RemoteCache) processNinjaBuild(ctx context.Context, build *Build, rule *Rule) error {
+	// Create Action from build and rule
+	action := &remote.Action{
+		CommandDigest:   &remote.Digest{}, // We'll set this after uploading command
+		InputRootDigest: &remote.Digest{}, // We'll set this after uploading inputs
+		DoNotCache:      false,
+	}
+
+	expandedCommand := expandVariables(rule.Command, build.Inputs, build.Outputs)
+	// Create Command from rule
+	command := &remote.Command{
+		Arguments:   strings.Fields(expandedCommand),
+		OutputFiles: build.Outputs,
+	}
+
+	// Upload command
+	commandData, err := proto.Marshal(command)
+	if err != nil {
+		return fmt.Errorf("failed to marshal command: %v", err)
+	}
+
+	commandDigest, err := rc.uploadBlob(ctx, commandData)
+	if err != nil {
+		return fmt.Errorf("failed to upload command: %v", err)
+	}
+	action.CommandDigest = commandDigest
+
+	// Create input root directory
+	inputRoot := &remote.Directory{}
+	for _, input := range build.Inputs {
+		data, err := os.ReadFile(input)
+		if err != nil {
+			return fmt.Errorf("failed to read input %s: %v", input, err)
+		}
+
+		digest, err := rc.uploadBlob(ctx, data)
+		if err != nil {
+			return fmt.Errorf("failed to upload input %s: %v", input, err)
+		}
+
+		inputRoot.Files = append(inputRoot.Files, &remote.FileNode{
+			Name:   filepath.Base(input),
+			Digest: digest,
+		})
+	}
+
+	// Upload input root
+	inputRootData, err := proto.Marshal(inputRoot)
+	if err != nil {
+		return fmt.Errorf("failed to marshal input root: %v", err)
+	}
+
+	inputRootDigest, err := rc.uploadBlob(ctx, inputRootData)
+	if err != nil {
+		return fmt.Errorf("failed to upload input root: %v", err)
+	}
+	action.InputRootDigest = inputRootDigest
+
+	// Compute action digest
+	actionDigest, err := computeActionDigest(action)
+	if err != nil {
+		return fmt.Errorf("failed to compute action digest: %v", err)
+	}
+
+	// Check action cache
+	result, err := rc.actionCache.GetActionResult(ctx, &remote.GetActionResultRequest{
+		ActionDigest: actionDigest,
+	})
+	if err == nil {
+		// Cache hit - download outputs
+		for _, output := range result.OutputFiles {
+			data, err := rc.downloadBlob(ctx, output.Digest)
+			if err != nil {
+				return fmt.Errorf("failed to download output %s: %v", output.Path, err)
+			}
+
+			if err := os.WriteFile(output.Path, data, 0644); err != nil {
+				return fmt.Errorf("failed to write output %s: %v", output.Path, err)
+			}
+		}
+		return nil
+	}
+
+	// Cache miss - execute command locally
+	cmd := exec.CommandContext(ctx, command.Arguments[0], command.Arguments[1:]...)
+	fmt.Printf("=== %s", cmd)
+	cmd.Stdout = os.Stdout // Capture output
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("command execution failed: %v", err)
+	}
+
+	// Create ActionResult
+	actionResult := &remote.ActionResult{}
+	for _, output := range build.Outputs {
+		data, err := os.ReadFile(output)
+		if err != nil {
+			return fmt.Errorf("failed to read output %s: %v", output, err)
+		}
+
+		digest, err := rc.uploadBlob(ctx, data)
+		if err != nil {
+			return fmt.Errorf("failed to upload output %s: %v", output, err)
+		}
+
+		actionResult.OutputFiles = append(actionResult.OutputFiles, &remote.OutputFile{
+			Path:   output,
+			Digest: digest,
+		})
+	}
+
+	// Update action cache
+	_, err = rc.actionCache.UpdateActionResult(ctx, &remote.UpdateActionResultRequest{
+		ActionDigest: actionDigest,
+		ActionResult: actionResult,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to update action cache: %v", err)
+	}
+
+	return nil
+}
+
+func resolveDependencies(nf *NinjaFile, target string) []*Build {
+	visited := make(map[string]bool)
+	var builds []*Build
+
+	var resolve func(output string)
+	resolve = func(output string) {
+		if visited[output] {
+			return
+		}
+		visited[output] = true
+
+		if build, exists := nf.Builds[output]; exists {
+			for _, input := range build.Inputs {
+				resolve(input)
+			}
+			builds = append(builds, build)
+		}
+	}
+
+	resolve(target)
+
+	// Reverse the builds slice
+	for i := 0; i < len(builds)/2; i++ {
+		j := len(builds) - 1 - i
+		builds[i], builds[j] = builds[j], builds[i]
+	}
+
+	return builds
+}
+
+func processNinjaFile(ctx context.Context, target string, nf *NinjaFile, remoteCache *RemoteCache) error {
+	if _, exists := nf.Builds[target]; exists {
+		buildsInDependencyOrder := resolveDependencies(nf, target)
+		for _, build := range buildsInDependencyOrder {
+			rule := nf.Rules[build.Rule]
+			if rule == nil {
+				return fmt.Errorf("undefined rule: %s", build.Rule)
+			}
+			if err := remoteCache.processNinjaBuild(ctx, build, rule); err != nil {
+				return fmt.Errorf("failed to process build %v: %v", build.Outputs, err)
+			}
+		}
+	}
+	return nil
+}
+
 func main() {
-	// 	ninjaContent := `rule clang_rule
-	//     depfile = $out.d
-	//     command = clang -g -Wall $
-	//         -MMD -MF $out.d $
-	//         -Wextra -Wno-sign-compare $
-	//         -O2 -c -o $out $in
+	// Set up connection to remote execution service
+	conn, err := grpc.Dial("localhost:8980", grpc.WithInsecure(), grpc.WithBlock())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to connect: %v\n", err)
+		os.Exit(1)
+	}
+	defer conn.Close()
 
-	// build .obj/examples/fib.o: clang_rule examples/fib.c`
+	remoteCache := NewRemoteCache(conn)
 
+	// Example ninja file
 	r, err := os.Open("build.ninja")
 	if err != nil {
 		panic(err)
@@ -142,198 +423,8 @@ func main() {
 		panic(err)
 	}
 
-	// Access parsed data
-	fmt.Printf("rule count %d build count %d", len(nf.Rules), len(nf.Builds))
-}
-
-type BuildAction struct {
-	Command     string
-	InputFiles  []string
-	OutputFiles []string
-}
-
-// func main() {
-// 	// Example usage with ninja build file
-// 	action := BuildAction{
-// 		Command: "clang -g -Wall -MMD -MF .obj/quickjs.o.d -Wextra -Wno-sign-compare " +
-// 			"-Wno-missing-field-initializers -Wundef -Wuninitialized -Wunused " +
-// 			"-Wno-unused-parameter -Wwrite-strings -Wchar-subscripts -funsigned-char " +
-// 			"-fwrapv -D_GNU_SOURCE -DCONFIG_VERSION=\"2024-02-14\" -DCONFIG_BIGNUM " +
-// 			"-O2 -c -o .obj/quickjs.o quickjs.c",
-// 		InputFiles:  []string{"quickjs.c"},
-// 		OutputFiles: []string{".obj/quickjs.o", ".obj/quickjs.o.d"},
-// 	}
-
-// 	if err := executeBuildAction(action); err != nil {
-// 		fmt.Printf("Build failed: %v\n", err)
-// 		os.Exit(1)
-// 	}
-// }
-
-func executeBuildAction(action BuildAction) error {
-	ctx := context.Background()
-
-	// Connect to remote cache server
-	conn, err := grpc.Dial("127.0.0.1:8980", grpc.WithInsecure(), grpc.WithBlock())
-	if err != nil {
-		return fmt.Errorf("failed to connect to remote cache: %v", err)
+	if err := processNinjaFile(context.Background(), "qjs", nf, remoteCache); err != nil {
+		fmt.Fprintf(os.Stderr, "Build failed: %v\n", err)
+		os.Exit(1)
 	}
-	defer conn.Close()
-
-	// Create clients
-	acClient := pb.NewActionCacheClient(conn)
-	casClient := pb.NewContentAddressableStorageClient(conn)
-
-	// Calculate action digest
-	actionProto := &pb.Action{
-		CommandDigest:   computeCommandDigest(action.Command),
-		InputRootDigest: computeInputRootDigest(action.InputFiles),
-	}
-	actionBytes, err := proto.Marshal(actionProto)
-	if err != nil {
-		return fmt.Errorf("failed to marshal action: %v", err)
-	}
-	actionDigest := computeDigest(actionBytes)
-
-	// Check if result exists in action cache
-	req := &pb.GetActionResultRequest{
-		InstanceName: "",
-		ActionDigest: actionDigest,
-	}
-	result, err := acClient.GetActionResult(ctx, req)
-	if err == nil {
-		// Cache hit - download outputs
-		for _, output := range result.OutputFiles {
-			if err := downloadOutput(ctx, casClient, output); err != nil {
-				return fmt.Errorf("failed to download output: %v", err)
-			}
-		}
-		fmt.Println("Build outputs restored from cache")
-		return nil
-	}
-
-	// Cache miss - execute the command
-	fmt.Println("Cache miss, executing build command")
-	if err := executeCommand(action.Command); err != nil {
-		return fmt.Errorf("command execution failed: %v", err)
-	}
-
-	// Upload outputs to CAS and update action cache
-	outputDigests := make([]*pb.OutputFile, 0, len(action.OutputFiles))
-	for _, path := range action.OutputFiles {
-		digest, err := uploadOutput(ctx, casClient, path)
-		if err != nil {
-			return fmt.Errorf("failed to upload output %s: %v", path, err)
-		}
-		outputDigests = append(outputDigests, &pb.OutputFile{
-			Path:   path,
-			Digest: digest,
-		})
-	}
-
-	// Update action cache
-	actionResult := &pb.ActionResult{
-		OutputFiles: outputDigests,
-	}
-	updateReq := &pb.UpdateActionResultRequest{
-		ActionDigest: actionDigest,
-		ActionResult: actionResult,
-	}
-	if _, err := acClient.UpdateActionResult(ctx, updateReq); err != nil {
-		return fmt.Errorf("failed to update action cache: %v", err)
-	}
-
-	return nil
-}
-
-func executeCommand(command string) error {
-	parts := strings.Fields(command)
-	cmd := exec.Command(parts[0], parts[1:]...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
-
-func computeDigest(data []byte) *pb.Digest {
-	hash := sha256.Sum256(data)
-	return &pb.Digest{
-		Hash:      hex.EncodeToString(hash[:]),
-		SizeBytes: int64(len(data)),
-	}
-}
-
-func computeCommandDigest(command string) *pb.Digest {
-	cmd := &pb.Command{
-		Arguments: strings.Fields(command),
-	}
-	data, _ := proto.Marshal(cmd)
-	return computeDigest(data)
-}
-
-func computeInputRootDigest(inputs []string) *pb.Digest {
-	// Create Directory message with input files
-	dir := &pb.Directory{}
-	for _, path := range inputs {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		digest := computeDigest(data)
-		dir.Files = append(dir.Files, &pb.FileNode{
-			Name:   filepath.Base(path),
-			Digest: digest,
-		})
-	}
-	data, _ := proto.Marshal(dir)
-	return computeDigest(data)
-}
-
-func uploadOutput(ctx context.Context, client pb.ContentAddressableStorageClient, path string) (*pb.Digest, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-
-	digest := computeDigest(data)
-	req := &pb.BatchUpdateBlobsRequest{
-		Requests: []*pb.BatchUpdateBlobsRequest_Request{
-			{
-				Digest: digest,
-				Data:   data,
-			},
-		},
-	}
-
-	if _, err := client.BatchUpdateBlobs(ctx, req); err != nil {
-		return nil, err
-	}
-	return digest, nil
-}
-
-func downloadOutput(ctx context.Context, client pb.ContentAddressableStorageClient, output *pb.OutputFile) error {
-	req := &pb.BatchReadBlobsRequest{
-		Digests: []*pb.Digest{output.Digest},
-	}
-
-	resp, err := client.BatchReadBlobs(ctx, req)
-	if err != nil {
-		return err
-	}
-
-	if len(resp.Responses) == 0 {
-		return fmt.Errorf("no blob data received")
-	}
-
-	if resp.Responses[0].Status.Code != 0 {
-		return fmt.Errorf("failed to download blob: %v", resp.Responses[0].Status.Message)
-	}
-
-	// Ensure output directory exists
-	if dir := filepath.Dir(output.Path); dir != "." {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return err
-		}
-	}
-
-	return os.WriteFile(output.Path, resp.Responses[0].Data, 0644)
 }
