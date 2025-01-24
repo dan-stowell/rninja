@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,8 +10,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-
-	"bufio"
 
 	pb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	"google.golang.org/grpc"
