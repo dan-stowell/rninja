@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,13 +34,13 @@ type NinjaFile struct {
 	Builds []*Build
 }
 
-func ParseNinja(content string) (*NinjaFile, error) {
+func ParseNinja(r io.Reader) (*NinjaFile, error) {
 	nf := &NinjaFile{
 		Rules:  make(map[string]*Rule),
 		Builds: make([]*Build, 0),
 	}
 
-	scanner := bufio.NewScanner(strings.NewReader(content))
+	scanner := bufio.NewScanner(r)
 	var currentRule *Rule
 	var continuedLine string
 
@@ -123,24 +124,26 @@ func parseBuildLine(line string) *Build {
 
 // Example usage:
 func main() {
-	ninjaContent := `rule clang_rule
-    depfile = $out.d
-    command = clang -g -Wall $
-        -MMD -MF $out.d $
-        -Wextra -Wno-sign-compare $
-        -O2 -c -o $out $in
+	// 	ninjaContent := `rule clang_rule
+	//     depfile = $out.d
+	//     command = clang -g -Wall $
+	//         -MMD -MF $out.d $
+	//         -Wextra -Wno-sign-compare $
+	//         -O2 -c -o $out $in
 
-build .obj/examples/fib.o: clang_rule examples/fib.c`
+	// build .obj/examples/fib.o: clang_rule examples/fib.c`
 
-	nf, err := ParseNinja(ninjaContent)
+	r, err := os.Open("build.ninja")
+	if err != nil {
+		panic(err)
+	}
+	nf, err := ParseNinja(r)
 	if err != nil {
 		panic(err)
 	}
 
 	// Access parsed data
-	rule := nf.Rules["clang_rule"]
-	build := nf.Builds[0]
-	fmt.Printf("rule %v build %v", rule, build)
+	fmt.Printf("rule count %d build count %d", len(nf.Rules), len(nf.Builds))
 }
 
 type BuildAction struct {
