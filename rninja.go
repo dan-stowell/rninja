@@ -10,10 +10,139 @@ import (
 	"path/filepath"
 	"strings"
 
+	"bufio"
+
 	pb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 )
+
+type Rule struct {
+	Name    string
+	Depfile string
+	Command string
+}
+
+type Build struct {
+	Outputs []string
+	Rule    string
+	Inputs  []string
+}
+
+type NinjaFile struct {
+	Rules  map[string]*Rule
+	Builds []*Build
+}
+
+func ParseNinja(content string) (*NinjaFile, error) {
+	nf := &NinjaFile{
+		Rules:  make(map[string]*Rule),
+		Builds: make([]*Build, 0),
+	}
+
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	var currentRule *Rule
+	var continuedLine string
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		// Skip empty lines and comments
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Handle line continuations
+		if strings.HasSuffix(line, "$") {
+			continuedLine += strings.TrimSuffix(line, "$")
+			continue
+		}
+		if continuedLine != "" {
+			line = continuedLine + line
+			continuedLine = ""
+		}
+
+		// Parse rules
+		if strings.HasPrefix(line, "rule ") {
+			ruleName := strings.TrimPrefix(line, "rule ")
+			currentRule = &Rule{Name: ruleName}
+			nf.Rules[ruleName] = currentRule
+			continue
+		}
+
+		// Parse rule properties
+		if currentRule != nil && strings.Contains(line, "=") {
+			parts := strings.SplitN(line, "=", 2)
+			key := strings.TrimSpace(parts[0])
+			value := strings.TrimSpace(parts[1])
+
+			switch key {
+			case "depfile":
+				currentRule.Depfile = value
+			case "command":
+				currentRule.Command = value
+			}
+			continue
+		}
+
+		// Parse build statements
+		if strings.HasPrefix(line, "build ") {
+			build := parseBuildLine(line)
+			if build != nil {
+				nf.Builds = append(nf.Builds, build)
+			}
+			currentRule = nil
+		}
+	}
+
+	return nf, scanner.Err()
+}
+
+func parseBuildLine(line string) *Build {
+	// Remove "build " prefix
+	line = strings.TrimPrefix(line, "build ")
+
+	// Split into outputs and rule+inputs
+	parts := strings.Split(line, ":")
+	if len(parts) != 2 {
+		return nil
+	}
+
+	outputs := strings.Fields(parts[0])
+	ruleAndInputs := strings.Fields(parts[1])
+
+	if len(ruleAndInputs) < 1 {
+		return nil
+	}
+
+	return &Build{
+		Outputs: outputs,
+		Rule:    ruleAndInputs[0],
+		Inputs:  ruleAndInputs[1:],
+	}
+}
+
+// Example usage:
+func main() {
+	ninjaContent := `rule clang_rule
+    depfile = $out.d
+    command = clang -g -Wall $
+        -MMD -MF $out.d $
+        -Wextra -Wno-sign-compare $
+        -O2 -c -o $out $in
+
+build .obj/examples/fib.o: clang_rule examples/fib.c`
+
+	nf, err := ParseNinja(ninjaContent)
+	if err != nil {
+		panic(err)
+	}
+
+	// Access parsed data
+	rule := nf.Rules["clang_rule"]
+	build := nf.Builds[0]
+	fmt.Printf("rule %v build %v", rule, build)
+}
 
 type BuildAction struct {
 	Command     string
@@ -21,23 +150,23 @@ type BuildAction struct {
 	OutputFiles []string
 }
 
-func main() {
-	// Example usage with ninja build file
-	action := BuildAction{
-		Command: "clang -g -Wall -MMD -MF .obj/quickjs.o.d -Wextra -Wno-sign-compare " +
-			"-Wno-missing-field-initializers -Wundef -Wuninitialized -Wunused " +
-			"-Wno-unused-parameter -Wwrite-strings -Wchar-subscripts -funsigned-char " +
-			"-fwrapv -D_GNU_SOURCE -DCONFIG_VERSION=\"2024-02-14\" -DCONFIG_BIGNUM " +
-			"-O2 -c -o .obj/quickjs.o quickjs.c",
-		InputFiles:  []string{"quickjs.c"},
-		OutputFiles: []string{".obj/quickjs.o", ".obj/quickjs.o.d"},
-	}
+// func main() {
+// 	// Example usage with ninja build file
+// 	action := BuildAction{
+// 		Command: "clang -g -Wall -MMD -MF .obj/quickjs.o.d -Wextra -Wno-sign-compare " +
+// 			"-Wno-missing-field-initializers -Wundef -Wuninitialized -Wunused " +
+// 			"-Wno-unused-parameter -Wwrite-strings -Wchar-subscripts -funsigned-char " +
+// 			"-fwrapv -D_GNU_SOURCE -DCONFIG_VERSION=\"2024-02-14\" -DCONFIG_BIGNUM " +
+// 			"-O2 -c -o .obj/quickjs.o quickjs.c",
+// 		InputFiles:  []string{"quickjs.c"},
+// 		OutputFiles: []string{".obj/quickjs.o", ".obj/quickjs.o.d"},
+// 	}
 
-	if err := executeBuildAction(action); err != nil {
-		fmt.Printf("Build failed: %v\n", err)
-		os.Exit(1)
-	}
-}
+// 	if err := executeBuildAction(action); err != nil {
+// 		fmt.Printf("Build failed: %v\n", err)
+// 		os.Exit(1)
+// 	}
+// }
 
 func executeBuildAction(action BuildAction) error {
 	ctx := context.Background()
