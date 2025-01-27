@@ -16,7 +16,6 @@ import (
 
 	remote "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -450,16 +449,7 @@ func processNinjaFile(ctx context.Context, target string, nf *NinjaFile, remoteC
 }
 
 func main() {
-	ctx := context.Background()
-	instanceName := "shard" // Adjust this to match your BuildFarm config
-
-	// Set up metadata for instance name
-	md := metadata.New(map[string]string{
-		"instance-name": instanceName,
-	})
-	ctx = metadata.NewOutgoingContext(ctx, md)
-
-	conn, err := grpc.Dial("localhost:8980",
+	conn, err := grpc.Dial("localhost:9092",
 		grpc.WithInsecure(),
 		grpc.WithBlock(),
 		grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(4*1024*1024)))
