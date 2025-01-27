@@ -12,9 +12,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	remote "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -183,7 +185,9 @@ func (rc *RemoteCache) uploadBlob(ctx context.Context, data []byte) (*remote.Dig
 		SizeBytes: int64(len(data)),
 	}
 
-	// Check if blob already exists
+	// Debug prints
+	log.Printf("Checking blob %s (%d bytes)", digest.Hash, digest.SizeBytes)
+
 	resp, err := rc.cas.FindMissingBlobs(ctx, &remote.FindMissingBlobsRequest{
 		BlobDigests: []*remote.Digest{digest},
 	})
@@ -191,14 +195,16 @@ func (rc *RemoteCache) uploadBlob(ctx context.Context, data []byte) (*remote.Dig
 		return nil, fmt.Errorf("failed to check blob existence: %v", err)
 	}
 
+	log.Printf("Missing blobs response: %+v", resp)
+
 	if len(resp.MissingBlobDigests) > 0 {
-		// Upload if missing
-		_, err = rc.cas.BatchUpdateBlobs(ctx, &remote.BatchUpdateBlobsRequest{
+		batchResp, err := rc.cas.BatchUpdateBlobs(ctx, &remote.BatchUpdateBlobsRequest{
 			Requests: []*remote.BatchUpdateBlobsRequest_Request{{
 				Digest: digest,
 				Data:   data,
 			}},
 		})
+		log.Printf("Batch update response: %+v", batchResp)
 		if err != nil {
 			return nil, fmt.Errorf("failed to upload blob: %v", err)
 		}
@@ -236,6 +242,15 @@ func expandVariables(command string, in []string, out []string) string {
 
 func (rc *RemoteCache) processNinjaBuild(ctx context.Context, build *Build, rule *Rule) error {
 	log.Printf("processNinjaBuild %v", build)
+
+	needsRebuild, err := needsRebuild(build.Outputs, build.Inputs)
+	if err != nil {
+		return fmt.Errorf("failed to check if rebuild needed: %v", err)
+	}
+	if !needsRebuild {
+		log.Printf("Skipping up-to-date target: %v", build.Outputs)
+		return nil
+	}
 	// Create Action from build and rule
 	action := &remote.Action{
 		CommandDigest:   &remote.Digest{}, // We'll set this after uploading command
@@ -303,6 +318,7 @@ func (rc *RemoteCache) processNinjaBuild(ctx context.Context, build *Build, rule
 	result, err := rc.actionCache.GetActionResult(ctx, &remote.GetActionResultRequest{
 		ActionDigest: actionDigest,
 	})
+	log.Printf("Cache lookup for action %s: hit=%v", actionDigest.Hash, err == nil)
 	if err == nil {
 		// Cache hit - download outputs
 		for _, output := range result.OutputFiles {
@@ -351,11 +367,39 @@ func (rc *RemoteCache) processNinjaBuild(ctx context.Context, build *Build, rule
 		ActionDigest: actionDigest,
 		ActionResult: actionResult,
 	})
+	log.Printf("Cache update for action %s: err=%v", actionDigest.Hash, err)
 	if err != nil {
 		return fmt.Errorf("failed to update action cache: %v", err)
 	}
 
 	return nil
+}
+
+func needsRebuild(outputs, inputs []string) (bool, error) {
+	var oldestOutput time.Time
+	for _, output := range outputs {
+		info, err := os.Stat(output)
+		if os.IsNotExist(err) {
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if oldestOutput.IsZero() || info.ModTime().Before(oldestOutput) {
+			oldestOutput = info.ModTime()
+		}
+	}
+
+	for _, input := range inputs {
+		info, err := os.Stat(input)
+		if err != nil {
+			return false, err
+		}
+		if info.ModTime().After(oldestOutput) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func resolveDependencies(nf *NinjaFile, target string) []*Build {
@@ -406,11 +450,21 @@ func processNinjaFile(ctx context.Context, target string, nf *NinjaFile, remoteC
 }
 
 func main() {
-	// Set up connection to remote execution service
-	conn, err := grpc.Dial("localhost:8980", grpc.WithInsecure(), grpc.WithBlock())
+	ctx := context.Background()
+	instanceName := "shard" // Adjust this to match your BuildFarm config
+
+	// Set up metadata for instance name
+	md := metadata.New(map[string]string{
+		"instance-name": instanceName,
+	})
+	ctx = metadata.NewOutgoingContext(ctx, md)
+
+	conn, err := grpc.Dial("localhost:8980",
+		grpc.WithInsecure(),
+		grpc.WithBlock(),
+		grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(4*1024*1024)))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to connect: %v\n", err)
-		os.Exit(1)
+		log.Fatalf("Failed to connect: %v", err)
 	}
 	defer conn.Close()
 
