@@ -326,7 +326,17 @@ func (rc *RemoteCache) processNinjaBuild(ctx context.Context, build *Build, rule
 				return fmt.Errorf("failed to download output %s: %v", output.Path, err)
 			}
 
-			if err := os.WriteFile(output.Path, data, 0644); err != nil {
+			// Set executable permissions if marked in the cache
+			var mode os.FileMode = 0644
+			if output.IsExecutable {
+				mode = 0755
+			}
+
+			// Ensure output directory exists
+			if err := os.MkdirAll(filepath.Dir(output.Path), 0755); err != nil {
+				return fmt.Errorf("failed to create output directory: %v", err)
+			}
+			if err := os.WriteFile(output.Path, data, mode); err != nil {
 				return fmt.Errorf("failed to write output %s: %v", output.Path, err)
 			}
 		}
@@ -355,9 +365,16 @@ func (rc *RemoteCache) processNinjaBuild(ctx context.Context, build *Build, rule
 			return fmt.Errorf("failed to upload output %s: %v", output, err)
 		}
 
+		// Get file permissions
+		info, err := os.Stat(output)
+		if err != nil {
+			return fmt.Errorf("failed to stat output %s: %v", output, err)
+		}
+
 		actionResult.OutputFiles = append(actionResult.OutputFiles, &remote.OutputFile{
-			Path:   output,
-			Digest: digest,
+			Path:         output,
+			Digest:       digest,
+			IsExecutable: info.Mode().Perm()&0111 != 0,
 		})
 	}
 
